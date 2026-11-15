@@ -32,10 +32,10 @@ canvas { position:fixed; inset:0; width:100%; height:100%; display:block; }
 <button class="hb" id="btnCenter">中心</button>
 <div id="start">
   <h1>FSAE_sample @ ASE</h1>
-  <p>スマホを横にしてハンドルのように回すと舵が切れます（ロック to ロック = 傾き 90°）。<br>
+  <p>スマホを横にしてハンドルのように回すと舵が切れます（ロック to ロック = 下で設定した傾き）。<br>
   右下を長押し = アクセル、左下を長押し = ブレーキ。ギアは自動。<br>
   スタート時の持ち方が舵の中心になります（あとで「中心」ボタンで取り直せます）。</p>
-  <label>中心付近の感度 <input type="range" id="lin" min="0.15" max="1" step="0.05" value="0.35"> <span id="linv">0.35</span></label>
+  <label>ロック to ロック（傾き） <input type="range" id="l2l" min="20" max="180" step="5" value="60"> <span id="l2lv">60</span>°</label>
   <label><input type="checkbox" id="inv"> 舵の向きを反転</label>
   <button id="go">スタート</button>
   <div id="warn"></div>
@@ -223,12 +223,12 @@ function coulomb(w, dw) { return Math.abs(w) <= dw ? 0 : w - Math.sign(w)*dw; }
 
 // ===================== 入力 =====================
 const input = { thr:false, brk:false, steer:0, tilt:null, tilt0:0, keyL:false, keyR:false, kb:0, motion:false };
-let LIN = 0.35, INV = false;
-try { const s = JSON.parse(localStorage.getItem('fsae_sample_cfg') || '{}'); if (s.lin) LIN = s.lin; if (s.inv) INV = s.inv; } catch(e) {}
-const linEl = document.getElementById('lin'), invEl = document.getElementById('inv');
-linEl.value = LIN; document.getElementById('linv').textContent = LIN; invEl.checked = INV;
-const saveCfg = () => { try { localStorage.setItem('fsae_sample_cfg', JSON.stringify({lin:LIN, inv:INV})); } catch(e) {} };
-linEl.oninput = () => { LIN = +linEl.value; document.getElementById('linv').textContent = LIN.toFixed(2); saveCfg(); };
+let L2L = 60, INV = false;
+try { const s = JSON.parse(localStorage.getItem('fsae_sample_cfg') || '{}'); if (s.l2l) L2L = s.l2l; if (s.inv) INV = s.inv; } catch(e) {}
+const l2lEl = document.getElementById('l2l'), invEl = document.getElementById('inv');
+l2lEl.value = L2L; document.getElementById('l2lv').textContent = L2L; invEl.checked = INV;
+const saveCfg = () => { try { localStorage.setItem('fsae_sample_cfg', JSON.stringify({l2l:L2L, inv:INV})); } catch(e) {} };
+l2lEl.oninput = () => { L2L = +l2lEl.value; document.getElementById('l2lv').textContent = L2L; saveCfg(); };
 invEl.onchange = () => { INV = invEl.checked; saveCfg(); };
 
 function screenAngle() {
@@ -243,11 +243,10 @@ function onMotion(e) {
   input.motion = true;
 }
 const wrap = d => ((d + 540) % 360) - 180;
-// 傾き → ハンドル角。傾き ±45°（ロック to ロック 90°）= ロック ±84°。中心付近は u の 3 乗を混ぜて細かく
-const TILT_LOCK = 45;
+// 傾き → ハンドル角（リニア）。傾き ±L2L/2 = ロック ±84°
 function steerMap(tiltDeg) {
-  const u = Math.max(-1, Math.min(1, tiltDeg / TILT_LOCK));
-  return CAR.steerLock * (LIN*u + (1-LIN)*u*u*u);
+  const u = Math.max(-1, Math.min(1, tiltDeg / (L2L / 2)));
+  return CAR.steerLock * u;
 }
 
 const touches = new Map();
@@ -470,7 +469,7 @@ function frame(now) {
     input.kb += ((input.keyR?1:0) - (input.keyL?1:0)) * dtr * 1.5;
     if (!input.keyL && !input.keyR) input.kb *= Math.exp(-dtr*6);
     input.kb = Math.max(-1, Math.min(1, input.kb));
-    sw = steerMap(input.kb * TILT_LOCK);
+    sw = steerMap(input.kb * L2L / 2);
   }
   const deltaT = -sw / CAR.steerRatio * Math.PI/180; // 左が +
   const t0 = performance.now();
