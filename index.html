@@ -1,0 +1,498 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>FSAE_sample @ ASE</title>
+<style>
+:root { --bg:#2a2f35; --fg:#e8ecf0; --dim:rgba(232,236,240,.35); }
+html,body { margin:0; height:100%; background:var(--bg); color:var(--fg); overflow:hidden;
+  font:14px/1.3 system-ui,-apple-system,"Segoe UI",sans-serif; touch-action:none;
+  -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
+[hidden] { display:none !important; }
+canvas { position:fixed; inset:0; width:100%; height:100%; display:block; }
+#start { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center;
+  gap:12px; background:rgba(11,13,16,.92); padding:16px; text-align:center; z-index:5; }
+#start h1 { margin:0; font-size:20px; letter-spacing:.04em; }
+#start p { margin:0; max-width:34em; color:#aab3bc; font-size:13px; }
+#start button, .hb { font:inherit; color:var(--fg); background:transparent; border:1px solid var(--fg);
+  border-radius:6px; padding:10px 22px; }
+#start label { display:flex; gap:8px; align-items:center; font-size:13px; }
+#start input[type=range] { width:180px; }
+#warn { color:#ffb070; font-size:12px; }
+.hb { position:fixed; padding:6px 10px; font-size:12px; z-index:3; border-color:var(--dim); }
+#btnReset { left:calc(8px + env(safe-area-inset-left,0px)); top:calc(64px + env(safe-area-inset-top,0px)); }
+#btnCenter { left:calc(78px + env(safe-area-inset-left,0px)); top:calc(64px + env(safe-area-inset-top,0px)); }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<button class="hb" id="btnReset">リセット</button>
+<button class="hb" id="btnCenter">中心</button>
+<div id="start">
+  <h1>FSAE_sample @ ASE</h1>
+  <p>スマホを横にしてハンドルのように回すと舵が切れます（ロック to ロック = 傾き 90°）。<br>
+  右下を長押し = アクセル、左下を長押し = ブレーキ。ギアは自動。<br>
+  スタート時の持ち方が舵の中心になります（あとで「中心」ボタンで取り直せます）。</p>
+  <label>中心付近の感度 <input type="range" id="lin" min="0.15" max="1" step="0.05" value="0.35"> <span id="linv">0.35</span></label>
+  <label><input type="checkbox" id="inv"> 舵の向きを反転</label>
+  <button id="go">スタート</button>
+  <div id="warn"></div>
+</div>
+<script>
+'use strict';
+// ===================== 車（FSAE_sample） =====================
+const CAR = {
+  m: 270, g: 9.81, L: 1.8, wdF: 0.45, h: 0.25, tw: 1.25,
+  Iz: 245,                       // INERTIA 箱 1.372x2.923 をばね上 235 kg で + ばね下
+  steerLock: 84, steerRatio: 5.0,
+  rollF: 0.45,                   // ARB 3499/0 → ロール剛性配分 前 45 %
+  // タイヤ（芯の温度は 前 40 / 後 67 ℃ で固定）
+  tyre: [
+    { R:0.2032, I:0.095, DY:1.7968, DX:1.5976, LS:0.72, FZ0:1200, FLA:8,  CF:2.3, FL:0.85, relax:0.5393, temp:40, cam:-1.0 },
+    { R:0.2286, I:0.15,  DY:1.9633, DX:1.6950, LS:0.72, FZ0:1200, FLA:10, CF:2.3, FL:0.85, relax:0.4626, temp:67, cam:-1.8 }],
+  dcam0: 1.3, dcam1: -13,
+  // エンジン・駆動
+  gears: [2.750, 2.000, 1.667, 1.444], final: 7.4341,
+  torque: [[0,3.72],[1500,3.72],[3000,10.60],[4000,16.28],[5000,22.79],[5500,25.02],[6000,30.60],[6500,37.11],[7000,42.41],[7500,45.76],[8000,47.43],[8500,48.92],[9000,46.87],[9500,49.29],[10000,51.06],[10500,51.80],[11000,51.99],[11500,52.08],[12000,52.17],[12500,41.76],[13500,9.30]],
+  throttleLut: [[0,0],[0.1,0.3],[0.2,0.5],[0.3,0.6],[0.4,0.7],[0.5,0.75],[0.6,0.8],[0.7,0.85],[0.8,0.9],[0.9,0.95],[1,1]],
+  limiter: 14000, idle: 1500, coastT: 20, coastRpm: 12000, Ieng: 0.006 + 0.004,
+  upRpm: 11500, dnRpm: 6000, upTime: 0.05, dnTime: 0.08,
+  diffPre: 10, diffPow: 0.1, diffCoast: 0.45,
+  brakeT: 270, brakeF: 0.46,
+  rho: 1.225,
+  tcurve: [[0,0.69],[10,0.75],[20,0.79],[30,0.83],[40,0.88],[50,0.92],[60,0.96],[65,0.99],[70,1],[75,1],[80,1],[85,0.99],[90,0.97],[100,0.92],[120,0.71]],
+};
+// 空力（面積 = 翼弦 x 幅、位置は重心から前 +）
+const A_ = CAR.L * CAR.wdF;      // 重心→後軸 b
+CAR.b = CAR.L * CAR.wdF; CAR.a = CAR.L - CAR.b;
+const wings = [
+  { A:1.5*1.038, CL:0,              CD:0.41*2.915,  z:0 },     // BODY
+  { A:1.0*1.40,  CL:0.957*0.582*1.04, CD:0.274*0.45, z:1.4 },  // FRONT（ANGLE 6、地面効果 ×1.04）
+  { A:1.0*1.038, CL:1.778*0.252,    CD:0.752*0.45,  z:-0.8 }]; // REAR（ANGLE 15）
+let CLAf = 0, CLAr = 0, CDA = 0;
+for (const w of wings) { const fs = (CAR.b + w.z) / CAR.L; CLAf += w.A*w.CL*fs; CLAr += w.A*w.CL*(1-fs); CDA += w.A*w.CD; }
+
+const lut = (t, x) => { if (x <= t[0][0]) return t[0][1]; for (let i = 1; i < t.length; i++) if (x <= t[i][0]) { const [x0,y0] = t[i-1], [x1,y1] = t[i]; return y0 + (y1-y0)*(x-x0)/(x1-x0); } return t[t.length-1][1]; };
+
+// タイヤの力の形（共通）
+const SH = { B:1.9525476, C:1.4958654, E:0.3476793, xp:0.8623773, k:0.4686863 };
+const pf = z => Math.sin(SH.C * Math.atan(z - SH.E*(z - Math.atan(z))));
+SH.pk = pf(SH.B * SH.xp);
+function shape(x, fl, fla) {
+  if (x <= SH.xp) return pf(SH.B * x);
+  return SH.pk * (fl + (1-fl) * Math.exp(-SH.k * (x - SH.xp) * fla / 10));
+}
+for (const t of CAR.tyre) {
+  t.aref = t.FLA * Math.PI/180; t.sref = Math.tan(t.aref);
+  const ca = Math.abs(t.cam*Math.PI/180);
+  t.mulT = lut(CAR.tcurve, t.temp) * (1 - (ca*CAR.dcam0 + ca*ca*CAR.dcam1));
+}
+// 1 輪の力。戻り: [Fx, Fy]（タイヤの向き。Fy は滑り角と逆向き）
+function tyreF(t, Fz, alpha, sr, out) {
+  if (Fz < 1) { out[0] = 0; out[1] = 0; return; }
+  const ls = Math.pow(Fz / t.FZ0, t.LS - 1) * t.mulT;
+  const Ay = t.DY * ls * Fz, Ax = t.DX * ls * Fz;
+  const xa = Math.abs(alpha) / t.aref, xs = Math.abs(sr) / t.sref;
+  const x = Math.pow(Math.pow(xa, t.CF) + Math.pow(xs, t.CF), 1/t.CF) + 1e-9;
+  const F = shape(x, t.FL, t.FLA);
+  out[0] = Ax * F * xs / x * Math.sign(sr);
+  out[1] = -Ay * F * xa / x * Math.sign(alpha);
+}
+
+// ===================== コース =====================
+let COURSE = null;
+
+// ===================== 状態 =====================
+const S = {};
+function reset() {
+  const C = COURSE.C, hi = /^#pc-(\d+)$/.exec(location.hash), i0 = hi ? +hi[1] % C.length : C.length - 4;   // #pc-<点の番号> で途中から
+  S.X = C[i0][0]; S.Y = C[i0][1];
+  S.psi = Math.atan2(C[i0+1][1]-C[i0][1], C[i0+1][0]-C[i0][0]);
+  S.vx = 0; S.vy = 0; S.r = 0;
+  S.w = [0,0,0,0]; S.al = [0,0,0,0];
+  S.ax = 0; S.ay = 0;
+  S.gear = 0; S.shift = 0; S.rpm = CAR.idle;
+  S.thr = 0; S.brk = 0; S.delta = 0;
+  S.idx = i0; S.lapT = null; S.t = 0; S.coneHit = new Set(); S.hits = 0;
+  S.touching = new Set(); S.flashL = -1e9; S.flashR = -1e9;
+}
+const posW = [[0,1],[0,-1],[1,1],[1,-1]];   // [軸, 左右(+左)]
+const ftmp = [0,0];
+const Fz = [0,0,0,0], FX = [0,0,0,0], FY = [0,0,0,0], KX = [0,0,0,0], VX = [0,0,0,0];
+
+function step(dt, thrIn, brkIn, delta) {
+  const c = CAR, m = c.m, v = Math.hypot(S.vx, S.vy);
+  // 荷重（静的 + 空力 + 前後・横の荷重移動）
+  const q = 0.5 * c.rho * S.vx * S.vx;
+  const fzF = (m*c.g*c.wdF + q*CLAf) / 2, fzR = (m*c.g*(1-c.wdF) + q*CLAr) / 2;
+  const dLong = m * S.ax * c.h / c.L / 2;
+  const dLat = m * S.ay * c.h / c.tw;
+  Fz[0] = fzF - dLong - dLat*c.rollF;      Fz[1] = fzF - dLong + dLat*c.rollF;
+  Fz[2] = fzR + dLong - dLat*(1-c.rollF);  Fz[3] = fzR + dLong + dLat*(1-c.rollF);
+
+  // 各輪の滑りと力
+  let sFx = 0, sFy = 0, sMz = 0;
+  const cd = Math.cos(delta), sd = Math.sin(delta);
+  for (let i = 0; i < 4; i++) {
+    const t = c.tyre[posW[i][0]];
+    const px = posW[i][0] === 0 ? c.a : -c.b, py = posW[i][1] * c.tw/2;
+    let vxw = S.vx - S.r*py, vyw = S.vy + S.r*px;
+    if (i < 2) { const a = vxw*cd + vyw*sd, b = -vxw*sd + vyw*cd; vxw = a; vyw = b; }
+    const den = Math.max(Math.abs(vxw), 1.0);
+    const ass = Math.atan2(vyw, Math.max(Math.abs(vxw), 0.3));
+    S.al[i] += (ass - S.al[i]) * Math.min(1, dt * (Math.abs(vxw) + 0.5) / t.relax);
+    const sr = (S.w[i]*t.R - vxw) / den;
+    Fz[i] = Math.max(Fz[i], 0);
+    tyreF(t, Fz[i], S.al[i], sr, ftmp);
+    const fx = ftmp[0], fy = ftmp[1];
+    tyreF(t, Fz[i], S.al[i], sr + 1e-3, ftmp);
+    KX[i] = Math.max((ftmp[0] - fx) / 1e-3, 0) * t.R / den;   // dFx/dω
+    FX[i] = fx; FY[i] = fy; VX[i] = vxw;
+    let bx = fx, by = fy;
+    if (i < 2) { bx = fx*cd - fy*sd; by = fx*sd + fy*cd; }
+    sFx += bx; sFy += by; sMz += px*by - py*bx;
+  }
+
+  // エンジン・変速
+  const g = c.gears[S.gear] * c.final;
+  const wm = (S.w[2] + S.w[3]) / 2;
+  let rpmW = wm * g * 60 / (2*Math.PI);
+  const thr = lut(c.throttleLut, thrIn);
+  let Td = 0, Ie = 0;
+  if (S.shift > 0) { S.shift -= dt; S.rpm = rpmW; }
+  else {
+    if (rpmW >= c.upRpm && S.gear < 3 && thrIn > 0.05) { S.gear++; S.shift = c.upTime; }
+    else if (rpmW < c.dnRpm && S.gear > 0 && rpmW * c.gears[S.gear-1]/c.gears[S.gear] < c.upRpm - 500) { S.gear--; S.shift = c.dnTime; }
+    else if (thr > 0.01 && rpmW < 6000) {          // 発進（クラッチを滑らせる）
+      S.rpm = 6000; Td = thr * lut(c.torque, 6000) * g;
+    } else if (rpmW < c.idle) { S.rpm = c.idle; }  // クラッチを切る
+    else {
+      S.rpm = rpmW;
+      const te = rpmW > c.limiter ? 0 : lut(c.torque, rpmW);
+      Td = (thr * te - (1-thr) * c.coastT * rpmW / c.coastRpm) * g;
+      Ie = c.Ieng * g * g;
+    }
+  }
+
+  // 車輪の回転（陰的に）。前は自由、後はデフ + エンジンの慣性
+  const brkT = brkIn * c.brakeT;
+  for (let i = 0; i < 2; i++) {
+    const t = c.tyre[0], Ieff = t.I + dt*t.R*KX[i];
+    S.w[i] += dt * (-t.R*FX[i]) / Ieff;
+    S.w[i] = coulomb(S.w[i], brkT*c.brakeF*dt/Ieff);
+  }
+  {
+    const t = c.tyre[1], R = t.R, I = t.I;
+    const cap = c.diffPre + (Td >= 0 ? c.diffPow : c.diffCoast) * Math.abs(Td) / 2;
+    const cdiff = 40;
+    const dw = S.w[2] - S.w[3];
+    let Tt = -cdiff * dw, sat = false;
+    if (Math.abs(Tt) > cap) { Tt = Math.sign(Tt) * cap; sat = true; }
+    const T0 = -R*FX[2] + Td/2 + Tt, T1 = -R*FX[3] + Td/2 - Tt;
+    const ck = sat ? 0 : cdiff;
+    const M00 = I + Ie/4 + dt*(R*KX[2] + ck), M01 = Ie/4 - dt*ck;
+    const M10 = Ie/4 - dt*ck, M11 = I + Ie/4 + dt*(R*KX[3] + ck);
+    const det = M00*M11 - M01*M10;
+    S.w[2] += dt * ( M11*T0 - M01*T1) / det;
+    S.w[3] += dt * (-M10*T0 + M00*T1) / det;
+    const Ib = I + Ie/2;
+    S.w[2] = coulomb(S.w[2], brkT*(1-c.brakeF)*dt/Ib);
+    S.w[3] = coulomb(S.w[3], brkT*(1-c.brakeF)*dt/Ib);
+  }
+
+  // 空気抵抗・転がり抵抗
+  const sgn = Math.tanh(S.vx / 0.3);
+  sFx -= (q * CDA + 4*6 + 4*0.00105*S.vx*S.vx) * sgn;
+
+  // 車体
+  const ax = sFx / m, ay = sFy / m;
+  S.vx += dt * (ax + S.r*S.vy);
+  S.vy += dt * (ay - S.r*S.vx);
+  S.r  += dt * sMz / c.Iz;
+  if (v < 0.3 && thrIn < 0.01) { S.vy *= 0.98; S.r *= 0.98; if (brkIn > 0.1) S.vx *= 0.98; }
+  const k = Math.min(1, dt / 0.04);              // 荷重移動の遅れ（ロール・ピッチ）
+  S.ax += (ax - S.ax) * k; S.ay += (ay - S.ay) * k;
+  const cp = Math.cos(S.psi), sp = Math.sin(S.psi);
+  S.X += dt * (S.vx*cp - S.vy*sp);
+  S.Y += dt * (S.vx*sp + S.vy*cp);
+  S.psi += dt * S.r;
+}
+function coulomb(w, dw) { return Math.abs(w) <= dw ? 0 : w - Math.sign(w)*dw; }
+
+// ===================== 入力 =====================
+const input = { thr:false, brk:false, steer:0, tilt:null, tilt0:0, keyL:false, keyR:false, kb:0, motion:false };
+let LIN = 0.35, INV = false;
+try { const s = JSON.parse(localStorage.getItem('fsae_sample_cfg') || '{}'); if (s.lin) LIN = s.lin; if (s.inv) INV = s.inv; } catch(e) {}
+const linEl = document.getElementById('lin'), invEl = document.getElementById('inv');
+linEl.value = LIN; document.getElementById('linv').textContent = LIN; invEl.checked = INV;
+const saveCfg = () => { try { localStorage.setItem('fsae_sample_cfg', JSON.stringify({lin:LIN, inv:INV})); } catch(e) {} };
+linEl.oninput = () => { LIN = +linEl.value; document.getElementById('linv').textContent = LIN.toFixed(2); saveCfg(); };
+invEl.onchange = () => { INV = invEl.checked; saveCfg(); };
+
+function screenAngle() {
+  if (screen.orientation && typeof screen.orientation.angle === 'number') return screen.orientation.angle;
+  return typeof window.orientation === 'number' ? window.orientation : 0;
+}
+function onMotion(e) {
+  const g = e.accelerationIncludingGravity; if (!g || g.x == null) return;
+  const a = screenAngle() * Math.PI/180;
+  const sx = g.x*Math.cos(a) - g.y*Math.sin(a), sy = g.x*Math.sin(a) + g.y*Math.cos(a);
+  input.tilt = Math.atan2(sx, sy) * 180/Math.PI;
+  input.motion = true;
+}
+const wrap = d => ((d + 540) % 360) - 180;
+// 傾き → ハンドル角。傾き ±45°（ロック to ロック 90°）= ロック ±84°。中心付近は u の 3 乗を混ぜて細かく
+const TILT_LOCK = 45;
+function steerMap(tiltDeg) {
+  const u = Math.max(-1, Math.min(1, tiltDeg / TILT_LOCK));
+  return CAR.steerLock * (LIN*u + (1-LIN)*u*u*u);
+}
+
+const touches = new Map();
+function zoneOf(x, y) {
+  const W = innerWidth, H = innerHeight;
+  if (y < H * 0.35) return null;
+  if (x < W * 0.4) return 'brk';
+  if (x > W * 0.6) return 'thr';
+  return null;
+}
+function updPedals() {
+  let t = false, b = false;
+  for (const z of touches.values()) { if (z === 'thr') t = true; if (z === 'brk') b = true; }
+  input.thr = t; input.brk = b;
+}
+const cv = document.getElementById('cv');
+cv.addEventListener('touchstart', e => { e.preventDefault(); for (const t of e.changedTouches) touches.set(t.identifier, zoneOf(t.clientX, t.clientY)); updPedals(); }, {passive:false});
+cv.addEventListener('touchmove', e => { e.preventDefault(); for (const t of e.changedTouches) touches.set(t.identifier, zoneOf(t.clientX, t.clientY)); updPedals(); }, {passive:false});
+const tend = e => { e.preventDefault(); for (const t of e.changedTouches) touches.delete(t.identifier); updPedals(); };
+cv.addEventListener('touchend', tend, {passive:false});
+cv.addEventListener('touchcancel', tend, {passive:false});
+cv.addEventListener('mousedown', e => { touches.set('m', zoneOf(e.clientX, e.clientY)); updPedals(); });
+addEventListener('mouseup', () => { touches.delete('m'); updPedals(); });
+addEventListener('keydown', e => { if (e.key==='ArrowUp') input.kThr=true; if (e.key==='ArrowDown') input.kBrk=true; if (e.key==='ArrowLeft') input.keyL=true; if (e.key==='ArrowRight') input.keyR=true; if (e.key==='r') reset(); });
+addEventListener('keyup', e => { if (e.key==='ArrowUp') input.kThr=false; if (e.key==='ArrowDown') input.kBrk=false; if (e.key==='ArrowLeft') input.keyL=false; if (e.key==='ArrowRight') input.keyR=false; });
+document.getElementById('btnReset').onclick = () => reset();
+document.getElementById('btnCenter').onclick = () => { if (input.tilt != null) input.tilt0 = input.tilt; };
+
+document.getElementById('go').onclick = async () => {
+  const warn = document.getElementById('warn');
+  try {
+    if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+      const r = await DeviceMotionEvent.requestPermission();
+      if (r !== 'granted') { warn.textContent = '傾きセンサーが許可されませんでした。'; }
+    }
+  } catch (e) { warn.textContent = '傾きセンサーの許可でエラー: ' + e.message; }
+  addEventListener('devicemotion', onMotion);
+  try { await document.documentElement.requestFullscreen(); } catch(e) {}
+  try { await screen.orientation.lock('landscape'); } catch(e) {}
+  try { await navigator.wakeLock.request('screen'); } catch(e) {}
+  setTimeout(() => { if (input.tilt != null) input.tilt0 = input.tilt; else if (!window.isSecureContext) warn.textContent = 'https で開かないと傾きが使えません。'; }, 300);
+  document.getElementById('start').hidden = true;
+};
+
+// ===================== 描画 =====================
+const ctx = cv.getContext('2d');
+let W = 0, H = 0, DPR = 1;
+function resize() { DPR = Math.min(devicePixelRatio || 1, 1.5); W = innerWidth; H = innerHeight; cv.width = W*DPR; cv.height = H*DPR; }
+addEventListener('resize', resize); resize();
+const SKY = '#2a2f35', GROUND = '#6a6c6e';   // 地面 = 舗装のグレー
+const CONE_R = 0.127, CONE_H = 0.28;        // パイロンの大きさ
+const EYE_H = 1.04, EYE_BACK = 0.12, VFOV = 50 * Math.PI/180, FAR = 120;
+
+function render() {
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  const cp = Math.cos(S.psi), sp = Math.sin(S.psi);
+  const cx = S.X - cp*EYE_BACK, cy = S.Y - sp*EYE_BACK;
+  const f = (H/2) / Math.tan(VFOV/2), hx = W/2, hy = H*0.45;
+  ctx.fillStyle = SKY; ctx.fillRect(0, 0, W, hy);
+  ctx.fillStyle = GROUND; ctx.fillRect(0, hy, W, H - hy);
+  // 地平線
+  ctx.strokeStyle = 'rgba(232,236,240,.25)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, hy); ctx.lineTo(W, hy); ctx.stroke();
+  const proj = (X, Y, Z, o) => { const dx = X-cx, dy = Y-cy; const fw = dx*cp + dy*sp, lf = -dx*sp + dy*cp; o[0]=fw; o[1]=lf; o[2]=Z; };
+  const P = [0,0,0], Q = [0,0,0];
+  const NEAR = 0.3;
+  const scr = (p) => [hx - p[1]/p[0]*f, hy + (EYE_H - p[2])/p[0]*f];
+  // 地面の点（速さの目安）
+  ctx.fillStyle = 'rgba(232,236,240,.28)';
+  const gs = 4, gx0 = Math.floor(cx/gs)*gs, gy0 = Math.floor(cy/gs)*gs;
+  for (let i = -10; i <= 10; i++) for (let j = -10; j <= 10; j++) {
+    proj(gx0+i*gs, gy0+j*gs, 0, P);
+    if (P[0] < 1 || P[0] > 40) continue;
+    const s = scr(P); const r = Math.max(0.6, 3/P[0]*f/60);
+    ctx.fillRect(s[0]-r/2, s[1]-r/2, r, r);
+  }
+  // 白線
+  ctx.strokeStyle = '#e8ecf0'; ctx.lineCap = 'round';
+  for (const line of [COURSE.L, COURSE.R]) {
+    const n = line.length;
+    for (let i = 0; i < n; i++) {
+      const a = line[i], b = line[(i+1)%n];
+      proj(a[0], a[1], 0, P); proj(b[0], b[1], 0, Q);
+      if ((P[0] < NEAR && Q[0] < NEAR) || (P[0] > FAR && Q[0] > FAR)) continue;
+      if (Math.abs(P[1]) > P[0]*3 + 20 && Math.abs(Q[1]) > Q[0]*3 + 20) continue;
+      let p = P.slice(), qq = Q.slice();
+      if (p[0] < NEAR) { const t = (NEAR-p[0])/(qq[0]-p[0]); p = [NEAR, p[1]+t*(qq[1]-p[1]), 0]; }
+      if (qq[0] < NEAR) { const t = (NEAR-qq[0])/(p[0]-qq[0]); qq = [NEAR, qq[1]+t*(p[1]-qq[1]), 0]; }
+      const s1 = scr(p), s2 = scr(qq);
+      ctx.lineWidth = Math.min(8, Math.max(1, 0.1 * f / ((p[0]+qq[0])/2)));
+      ctx.beginPath(); ctx.moveTo(s1[0], s1[1]); ctx.lineTo(s2[0], s2[1]); ctx.stroke();
+    }
+  }
+  // パイロン（立っているもの）
+  ctx.fillStyle = '#e8ecf0';
+  const nC = COURSE.cones.length;
+  for (let k = 0; k < nC; k++) {
+    const c = COURSE.cones[k];
+    proj(c[0], c[1], 0, P);
+    if (P[0] < NEAR || P[0] > FAR || Math.abs(P[1]) > P[0]*2 + 2) continue;
+    const b = scr(P), wpx = CONE_R/P[0]*f, hpx = CONE_H/P[0]*f;
+    ctx.globalAlpha = S.coneHit.has(k) ? 0.35 : 1;
+    ctx.beginPath(); ctx.moveTo(b[0]-wpx, b[1]); ctx.lineTo(b[0]+wpx, b[1]); ctx.lineTo(b[0], b[1]-hpx); ctx.closePath(); ctx.fill();
+  }
+  // 倒れたパイロン（スラロームの組の片方）。底の円 + 先端
+  for (let k = 0; k < COURSE.fallen.length; k++) {
+    const [x, y, ux, uy, len] = COURSE.fallen[k];
+    proj(x, y, 0, P);
+    if (P[0] < 1 || P[0] > FAR || Math.abs(P[1]) > P[0]*2 + 2) continue;
+    ctx.globalAlpha = S.coneHit.has(nC + k) ? 0.35 : 1;
+    const bx = x - ux*len/2, by = y - uy*len/2;
+    proj(x + ux*len/2, y + uy*len/2, 0.03, Q); const ap = scr(Q);
+    const ring = [];
+    for (let i = 0; i < 12; i++) {
+      const th = i / 12 * 2*Math.PI, cs = Math.cos(th)*CONE_R;
+      proj(bx - uy*cs, by + ux*cs, CONE_R + Math.sin(th)*CONE_R, Q); ring.push(scr(Q));
+    }
+    ctx.beginPath(); ring.forEach((r, i) => i ? ctx.lineTo(r[0], r[1]) : ctx.moveTo(r[0], r[1])); ctx.closePath(); ctx.fill();
+    for (let i = 0; i < 12; i++) { const r1 = ring[i], r2 = ring[(i+1)%12];
+      ctx.beginPath(); ctx.moveTo(ap[0], ap[1]); ctx.lineTo(r1[0], r1[1]); ctx.lineTo(r2[0], r2[1]); ctx.closePath(); ctx.fill(); }
+  }
+  ctx.globalAlpha = 1;
+}
+
+let fps = 0, fpsN = 0, fpsT = 0;
+function hud(simMs) {
+  const sl = 8 + (parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--sl')) || 0);
+  ctx.fillStyle = '#e8ecf0'; ctx.font = '600 15px system-ui, sans-serif'; ctx.textBaseline = 'top';
+  // FPS（右上）
+  ctx.textAlign = 'right';
+  ctx.fillText(`${fps.toFixed(0)} FPS  sim ${simMs.toFixed(1)} ms`, W - 10, 8);
+  ctx.textAlign = 'left';
+  const kmh = S.vx * 3.6;
+  ctx.font = '600 22px system-ui, sans-serif';
+  ctx.fillText(`${kmh.toFixed(0)} km/h  ${S.gear+1}速  ${Math.round(S.rpm)} rpm`, 10, 8);
+  ctx.font = '500 14px system-ui, sans-serif';
+  const lt = S.lapT == null ? '--' : (S.t - S.lapT).toFixed(2);
+  ctx.fillText(`ラップ ${lt}  前回 ${S.last ? S.last.toFixed(2) : '--'}  ベスト ${S.best ? S.best.toFixed(2) : '--'}  パイロン ${S.hits}`, 10, 36);
+  // 回転計
+  const rw = Math.min(260, W*0.3);
+  ctx.strokeStyle = 'rgba(232,236,240,.4)'; ctx.strokeRect(W/2 - rw/2, 10, rw, 8);
+  ctx.fillRect(W/2 - rw/2, 10, rw * Math.min(1, S.rpm / 14000), 8);
+  // ペダルの場所
+  const py = H*0.35;
+  ctx.strokeStyle = 'rgba(232,236,240,.18)'; ctx.lineWidth = 1;
+  ctx.strokeRect(0.5, py, W*0.4 - 1, H - py - 0.5); ctx.strokeRect(W*0.6 + 0.5, py, W*0.4 - 1, H - py - 0.5);
+  ctx.fillStyle = 'rgba(232,236,240,.08)';
+  ctx.fillRect(0, H - (H-py)*S.brk, W*0.4, (H-py)*S.brk);
+  ctx.fillRect(W*0.6, H - (H-py)*S.thr, W*0.4, (H-py)*S.thr);
+  ctx.fillStyle = 'rgba(232,236,240,.45)'; ctx.font = '500 13px system-ui, sans-serif'; ctx.textBaseline = 'bottom';
+  ctx.fillText('ブレーキ', 12, H - 10); ctx.textAlign = 'right'; ctx.fillText('アクセル', W - 12, H - 10); ctx.textAlign = 'left';
+  // 舵角（中央下）。目盛は ±84°
+  const sw = Math.min(300, W*0.36), sx0 = W/2, sy0 = H - 18;
+  ctx.strokeStyle = 'rgba(232,236,240,.4)';
+  ctx.beginPath(); ctx.moveTo(sx0 - sw/2, sy0); ctx.lineTo(sx0 + sw/2, sy0); ctx.stroke();
+  for (const d of [-60,-30,-10,0,10,30,60]) { const x = sx0 + d/84*sw/2; ctx.beginPath(); ctx.moveTo(x, sy0-4); ctx.lineTo(x, sy0+4); ctx.stroke(); }
+  const sdeg = S.delta * 180/Math.PI * CAR.steerRatio;
+  ctx.fillStyle = '#e8ecf0'; ctx.fillRect(sx0 - sdeg/84*sw/2 - 2, sy0 - 9, 4, 18);
+  ctx.textAlign = 'center'; ctx.fillStyle = 'rgba(232,236,240,.6)'; ctx.font = '500 12px system-ui, sans-serif';
+  ctx.fillText(`ハンドル ${(-sdeg).toFixed(1)}°  タイヤ ${(-S.delta*180/Math.PI).toFixed(2)}°  横G ${(S.ay/9.81).toFixed(2)}`, sx0, sy0 - 12);
+  if (!input.motion) ctx.fillText('傾きセンサーなし（PC: ← → ↑ ↓）', sx0, H*0.6);
+  ctx.textAlign = 'left';
+  // パイロンに当たった側の画面端に赤（1 秒で滑らかに消える。端から内へ薄くなる）
+  const now = performance.now();
+  for (const [t0, left] of [[S.flashL, true], [S.flashR, false]]) {
+    const x = (now - t0) / 1000;
+    if (x < 0 || x >= 1) continue;
+    const a = 0.85 * (1 - x) * (1 - x) * (x < 0.06 ? x / 0.06 : 1);
+    const wpx = Math.max(24, W * 0.06), x0 = left ? 0 : W - wpx;
+    const g = ctx.createLinearGradient(left ? 0 : W, 0, left ? wpx : W - wpx, 0);
+    g.addColorStop(0, `rgba(255,40,40,${a})`); g.addColorStop(1, 'rgba(255,40,40,0)');
+    ctx.fillStyle = g; ctx.fillRect(x0, 0, wpx, H);
+  }
+}
+
+// ラップとパイロン
+function track() {
+  const C = COURSE.C, n = C.length;
+  let best = S.idx, bd = 1e9;
+  for (let k = -25; k <= 25; k++) { const i = (S.idx + k + n) % n; const d = (C[i][0]-S.X)**2 + (C[i][1]-S.Y)**2; if (d < bd) { bd = d; best = i; } }
+  if (bd > 400) for (let i = 0; i < n; i++) { const d = (C[i][0]-S.X)**2 + (C[i][1]-S.Y)**2; if (d < bd) { bd = d; best = i; } }
+  const prev = S.idx; S.idx = best;
+  if (prev > n - 30 && best < 30) {                 // スタートラインを通過
+    if (S.lapT != null && S.t - S.lapT > 20) { S.last = S.t - S.lapT; S.best = S.best ? Math.min(S.best, S.last) : S.last; }
+    S.lapT = S.t; S.coneHit = new Set(); S.hits = 0;
+  }
+  const cp = Math.cos(S.psi), sp = Math.sin(S.psi);
+  // 車の外形（重心から 前 1.6 m・後 1.2 m・左右 0.72 m）+ パイロンの半径
+  const pts = COURSE.hitPts;
+  for (let k = 0; k < pts.length; k++) {
+    const dx = pts[k][0]-S.X, dy = pts[k][1]-S.Y;
+    if (dx*dx + dy*dy > 9) { S.touching.delete(k); continue; }
+    const fw = dx*cp + dy*sp, lf = -dx*sp + dy*cp;
+    const r = CONE_R;
+    if (fw < 1.6 + r && fw > -1.2 - r && Math.abs(lf) < 0.72 + r) {
+      if (!S.touching.has(k)) {                      // 当たり始め
+        S.touching.add(k);
+        if (lf > 0) S.flashL = performance.now(); else S.flashR = performance.now();
+        if (!S.coneHit.has(k)) { S.coneHit.add(k); S.hits++; }
+      }
+    } else S.touching.delete(k);
+  }
+}
+
+const DT = 1/1000;
+let last = performance.now(), acc = 0;
+function frame(now) {
+  let dtr = Math.min((now - last) / 1000, 0.05); last = now;
+  fpsN++; fpsT += dtr; if (fpsT >= 0.5) { fps = fpsN / fpsT; fpsN = 0; fpsT = 0; }
+  // 入力
+  const tThr = (input.thr || input.kThr) ? 1 : 0, tBrk = (input.brk || input.kBrk) ? 1 : 0;
+  S.thr += Math.sign(tThr - S.thr) * Math.min(Math.abs(tThr - S.thr), dtr / (tThr > S.thr ? 0.12 : 0.08));
+  S.brk += Math.sign(tBrk - S.brk) * Math.min(Math.abs(tBrk - S.brk), dtr / (tBrk > S.brk ? 0.10 : 0.08));
+  let sw;
+  if (input.motion && input.tilt != null) {
+    let d = -wrap(input.tilt - input.tilt0);          // 右に回すと atan2 の角は減る
+    if (INV) d = -d;
+    sw = steerMap(d);                               // + = 右に回した（ハンドル右）
+  } else {
+    input.kb += ((input.keyR?1:0) - (input.keyL?1:0)) * dtr * 1.5;
+    if (!input.keyL && !input.keyR) input.kb *= Math.exp(-dtr*6);
+    input.kb = Math.max(-1, Math.min(1, input.kb));
+    sw = steerMap(input.kb * TILT_LOCK);
+  }
+  const deltaT = -sw / CAR.steerRatio * Math.PI/180; // 左が +
+  const t0 = performance.now();
+  if (document.getElementById('start').hidden) {
+    acc += dtr;
+    let nmax = 60;
+    while (acc >= DT && nmax-- > 0) {
+      S.delta = deltaT;
+      if (S.lapT == null && S.thr > 0.01 && S.idx > 10 && S.idx < COURSE.C.length - 10) S.lapT = S.t;
+      step(DT, S.thr, S.brk, S.delta); S.t += DT; acc -= DT;
+    }
+    if (nmax <= 0) acc = 0;
+    track();
+  } else S.delta = deltaT;
+  const simMs = performance.now() - t0;
+  render(); hud(simMs);
+  requestAnimationFrame(frame);
+}
+
+if (location.hash.startsWith('#pc')) document.getElementById('start').hidden = true;   // PC で確認するとき
+fetch('course.json').then(r => r.json()).then(c => { COURSE = c; c.hitPts = c.cones.concat(c.fallen.map(q => [q[0], q[1]])); reset(); requestAnimationFrame(frame); })
+  .catch(e => { document.getElementById('warn').textContent = 'コースを読めません: ' + e.message; });
+</script>
+</body>
+</html>
