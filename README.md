@@ -6,4 +6,4 @@ FSAE_sample を ASE コースで走らせるブラウザ用の簡易ドライビ
 - 右下の長押し = アクセル、左下の長押し = ブレーキ、ギアは自動
 - PC では URL の末尾に `#pc` を付けて矢印キーで操作
 
-- https://masatoon0326.github.io/ase-drive/index.html
+- https://masatoon0326.github.io/ase-drive/asev1.html
